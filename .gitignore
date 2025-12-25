@@ -1,0 +1,4 @@
+# Visual Studio / WinForms
+.vs/
+**/bin/
+**/obj/
