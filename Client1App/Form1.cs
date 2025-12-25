@@ -1,8 +1,8 @@
 ﻿using Client1App.Security;
-using SharedSecurityLib.Crypto;
 using SharedSecurityLib.Protocol;
 using System;
 using System.IO;
+using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
@@ -25,27 +25,34 @@ namespace Client1App
         public Form1()
         {
             InitializeComponent();
+
+            HookLiveValidation();
+            UpdateButtonStates(); // ilk açılışta doğru enabled/disabled
         }
 
         private void Form1_Load(object sender, EventArgs e)
         {
-            // boş
+            // Katı sistem: otomatik default yazma yok.
+            // Kullanıcı girmek zorunda.
         }
 
         private async void btnConnectToCA_Click(object sender, EventArgs e)
         {
             try
             {
+                // 0) ZORUNLU: CA endpoint doğrula
+                var ca = GetRequiredEndpoint(txtCaIp, txtCaPort, "CA");
+
                 // 1) Client RSA key pair üret
                 _keys.GenerateClientKeys();
 
                 // 2) CA Public Key al
-                string caPubBase64 = await RequestCaPublicKeyAsync();
+                string caPubBase64 = await RequestCaPublicKeyAsync(ca.host, ca.port);
                 _keys.SetCaPublicKey(caPubBase64);
 
                 // 3) CA'den CERT iste
                 string req = _keys.BuildReqCertMessage("Client1");
-                string certMsg = await RequestCertFromCaAsync(req);
+                string certMsg = await RequestCertFromCaAsync(ca.host, ca.port, req);
 
                 // 4) CERT set + doğrula
                 _keys.SetMyCertificateFromCertMessage(certMsg);
@@ -59,6 +66,7 @@ namespace Client1App
 
                 MessageBox.Show(
                     (isValid ? "Sertifika doğrulandı ✅" : "Sertifika doğrulanamadı ❌") +
+                    $"\n\nCA Endpoint:\n{ca.host}:{ca.port}" +
                     "\n\nCA Key (preview):\n" + caPreview +
                     "\n\nCERT (preview):\n" + certPreview,
                     "Certificate Verification"
@@ -70,12 +78,12 @@ namespace Client1App
             }
         }
 
-        // -------- CA Helpers --------
+        // -------- CA Helpers (UI endpoint ile) --------
 
-        private static async Task<string> RequestCaPublicKeyAsync()
+        private static async Task<string> RequestCaPublicKeyAsync(string host, int port)
         {
             using TcpClient client = new TcpClient();
-            await client.ConnectAsync(ProtocolConstants.Localhost, ProtocolConstants.CaPort);
+            await client.ConnectAsync(host, port);
 
             using NetworkStream ns = client.GetStream();
 
@@ -99,10 +107,10 @@ namespace Client1App
             throw new Exception("Beklenmeyen CA cevabı: " + raw);
         }
 
-        private static async Task<string> RequestCertFromCaAsync(string reqCertMessage)
+        private static async Task<string> RequestCertFromCaAsync(string host, int port, string reqCertMessage)
         {
             using TcpClient client = new TcpClient();
-            await client.ConnectAsync(ProtocolConstants.Localhost, ProtocolConstants.CaPort);
+            await client.ConnectAsync(host, port);
 
             using NetworkStream ns = client.GetStream();
 
@@ -154,9 +162,87 @@ namespace Client1App
             }
         }
 
-        // -------- Client2 CERT Request --------
+        // -------- Client2 iletişimi (UI endpoint ile) --------
 
-        private static async Task<string> RequestClient2CertAsync(string host = "127.0.0.1", int port = 9100)
+        private async void btnSendKsToClient2_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                // ZORUNLU: Client2 endpoint
+                var c2 = GetRequiredEndpoint(txtClient2Ip, txtClient2Port, "Client2");
+
+                if (!_keys.HasCaPublicKey)
+                    throw new Exception("CA public key yok. Önce 'Connect to CA' ile sertifikanı doğrula.");
+
+                if (!_keys.HasClientKeys)
+                    _keys.GenerateClientKeys();
+
+                if (string.IsNullOrWhiteSpace(_myCertRaw))
+                {
+                    if (_keys.HasMyCertificate)
+                        _myCertRaw = _keys.BuildMyCertMessageRaw();
+                    else
+                        throw new Exception("Kendi CERT’in yok. Önce Connect to CA yap.");
+                }
+
+                // 1) Client2 CERT iste
+                string client2CertMsg = await RequestClient2CertAsync(c2.host, c2.port);
+
+                // 2) CERT parse: CERT:<clientId>:<pubKeyB64>:<sigB64>
+                var parts = ProtocolMessage.Parse(client2CertMsg);
+                if (parts.Length < 4)
+                    throw new Exception("Client2 CERT formatı hatalı.");
+
+                string clientId = parts[1];
+                string client2PubB64 = parts[2];
+                string sigB64 = parts[3];
+
+                // 3) CA ile doğrula
+                bool ok = _keys.VerifyOtherClientCertificate(clientId, client2PubB64, sigB64);
+                if (!ok)
+                    throw new Exception("Client2 CERT doğrulanamadı! Devam edilmiyor.");
+
+                // 4) (Opsiyonel ama güvenli) Client2'ye kendi CERT'imi gönder (mutual auth)
+                string peerCertResp = await SendAndReadLineAsync(
+                    MessageTypes.PEER_CERT + ":" + _myCertRaw,
+                    c2.host,
+                    c2.port
+                );
+
+                if (!peerCertResp.StartsWith("OK:", StringComparison.OrdinalIgnoreCase))
+                    throw new Exception("Client2, PEER_CERT kabul etmedi: " + peerCertResp);
+
+                // 5) Ks üret
+                byte[] ks = _keys.GenerateSessionKey(32);
+
+                // 6) Ks'i Client2 public key ile şifrele
+                byte[] encKs = _keys.EncryptBytesWithOtherPublicKeyBase64(client2PubB64, ks);
+                string encKsB64 = Convert.ToBase64String(encKs);
+
+                // 7) SESSION_KEY gönder
+                string resp = await SendAndReadLineAsync(
+                    MessageTypes.SESSION_KEY + ":" + encKsB64,
+                    c2.host,
+                    c2.port
+                );
+
+                if (!resp.StartsWith("OK:", StringComparison.OrdinalIgnoreCase))
+                    throw new Exception("SESSION_KEY başarısız / reddedildi: " + resp);
+
+                MessageBox.Show(
+                    "SESSION_KEY gönderildi ✅" +
+                    "\nClient2 kabul etti ✅" +
+                    "\n\nKs(Base64): " + Convert.ToBase64String(ks),
+                    "Client1"
+                );
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Hata: " + ex.Message, "Client1");
+            }
+        }
+
+        private static async Task<string> RequestClient2CertAsync(string host, int port)
         {
             using var tcp = new TcpClient();
             await tcp.ConnectAsync(host, port);
@@ -182,8 +268,7 @@ namespace Client1App
             return raw;
         }
 
-        // tek satır gönder/tek satır oku helper
-        private static async Task<string> SendAndReadLineAsync(string message, string host = "127.0.0.1", int port = 9100)
+        private static async Task<string> SendAndReadLineAsync(string message, string host, int port)
         {
             using var tcp = new TcpClient();
             await tcp.ConnectAsync(host, port);
@@ -198,116 +283,69 @@ namespace Client1App
             return resp?.Trim() ?? "";
         }
 
-        // -------- ADIM 9: Km handshake + Ks derivation --------
+        // -------- Strict Validation Helpers --------
 
-        private async void btnSendKsToClient2_Click(object sender, EventArgs e)
+        private static (string host, int port) GetRequiredEndpoint(TextBox txtIp, TextBox txtPort, string label)
         {
-            try
+            string ipRaw = (txtIp.Text ?? "").Trim();
+            string portRaw = (txtPort.Text ?? "").Trim();
+
+            if (string.IsNullOrWhiteSpace(ipRaw))
             {
-                if (!_keys.HasCaPublicKey)
-                    throw new Exception("CA public key yok. Önce 'Connect to CA' ile sertifikanı doğrula.");
-
-                if (!_keys.HasClientKeys)
-                    _keys.GenerateClientKeys();
-
-                if (string.IsNullOrWhiteSpace(_myCertRaw))
-                {
-                    if (_keys.HasMyCertificate)
-                        _myCertRaw = _keys.BuildMyCertMessageRaw();
-                    else
-                        throw new Exception("Kendi CERT’in yok. Önce Connect to CA yap.");
-                }
-
-                // 1) Client2 CERT iste
-                string client2CertMsg = await RequestClient2CertAsync();
-
-                // 2) CERT parse: CERT:<clientId>:<pubKeyB64>:<sigB64>
-                var parts = ProtocolMessage.Parse(client2CertMsg);
-                if (parts.Length < 4)
-                    throw new Exception("Client2 CERT formatı hatalı.");
-
-                string clientId = parts[1];
-                string client2PubB64 = parts[2];
-                string sigB64 = parts[3];
-
-                // 3) CA ile doğrula
-                bool ok = _keys.VerifyOtherClientCertificate(clientId, client2PubB64, sigB64);
-                if (!ok)
-                    throw new Exception("Client2 CERT doğrulanamadı! Devam edilmiyor.");
-
-                // 4) Client2'ye kendi CERT'imi gönder (KM2'yi bana şifreleyebilmesi için)
-                string peerCertResp = await SendAndReadLineAsync(MessageTypes.PEER_CERT + ":" + _myCertRaw);
-                if (!peerCertResp.StartsWith("OK:", StringComparison.OrdinalIgnoreCase))
-                    throw new Exception("Client2, PEER_CERT kabul etmedi: " + peerCertResp);
-
-                // 5) KM1 başlat: N1 üret
-                byte[] n1 = new byte[16];
-                RandomNumberGenerator.Fill(n1);
-                string n1B64 = Convert.ToBase64String(n1);
-
-                // KM1 payload: "N1B64:Client1"
-                string km1Payload = $"{n1B64}:Client1";
-                byte[] km1Plain = Encoding.UTF8.GetBytes(km1Payload);
-
-                // KM1 -> Client2 public key ile encrypt
-                byte[] km1Enc = _keys.EncryptBytesWithOtherPublicKeyBase64(client2PubB64, km1Plain);
-                string km1EncB64 = Convert.ToBase64String(km1Enc);
-
-                string km2Resp = await SendAndReadLineAsync(MessageTypes.KM1 + ":" + km1EncB64);
-                if (!km2Resp.StartsWith(MessageTypes.KM2 + ":", StringComparison.OrdinalIgnoreCase))
-                    throw new Exception("KM2 gelmedi: " + km2Resp);
-
-                // 6) KM2 decrypt (Client1 private key)
-                string km2EncB64 = km2Resp.Substring((MessageTypes.KM2 + ":").Length).Trim();
-                byte[] km2Enc = Convert.FromBase64String(km2EncB64);
-
-                byte[] km2Plain = _keys.DecryptBytesWithMyPrivateKey(km2Enc);
-                string km2Payload = Encoding.UTF8.GetString(km2Plain).Trim();
-
-                // payload: "N1B64:N2B64:Client2"
-                var parts2 = km2Payload.Split(':');
-                if (parts2.Length < 3)
-                    throw new Exception("KM2 payload hatalı.");
-
-                if (!string.Equals(parts2[0], n1B64, StringComparison.Ordinal))
-                    throw new Exception("KM2 N1 uyuşmuyor!");
-
-                string n2B64 = parts2[1];
-                byte[] n2 = Convert.FromBase64String(n2B64);
-
-                // 7) Km hesapla
-                byte[] km = CryptoHelper.DeriveMasterKey(n1, n2, "Client1", "Client2");
-
-                // 8) KM3 gönder: "N2B64" (Client2 public key ile encrypt)
-                byte[] km3Plain = Encoding.UTF8.GetBytes(n2B64);
-                byte[] km3Enc = _keys.EncryptBytesWithOtherPublicKeyBase64(client2PubB64, km3Plain);
-                string km3EncB64 = Convert.ToBase64String(km3Enc);
-
-                string km3Resp = await SendAndReadLineAsync(MessageTypes.KM3 + ":" + km3EncB64);
-                if (!km3Resp.StartsWith("OK:", StringComparison.OrdinalIgnoreCase))
-                    throw new Exception("KM3 başarısız: " + km3Resp);
-
-                // 9) Ks türet
-                byte[] ks = CryptoHelper.DeriveSessionKey(km);
-
-                // 10) SESSION_CONFIRM gönder (Client2 aynı Ks ile doğrulasın)
-                byte[] mac = CryptoHelper.BuildSessionConfirmMac(ks);
-                string macB64 = Convert.ToBase64String(mac);
-
-                string confirmResp = await SendAndReadLineAsync(MessageTypes.SESSION_CONFIRM + ":" + macB64);
-                if (!confirmResp.StartsWith("OK:", StringComparison.OrdinalIgnoreCase))
-                    throw new Exception("SESSION_CONFIRM başarısız: " + confirmResp);
-
-                MessageBox.Show(
-                    "Adım 9 tamam ✅\nKm üretildi ✅\nKs türetildi ✅\nClient2 doğruladı ✅" +
-                    "\n\nKs(Base64): " + Convert.ToBase64String(ks),
-                    "Client1"
-                );
+                txtIp.Focus();
+                throw new Exception($"{label} IP zorunlu. Lütfen IP adresi gir.");
             }
-            catch (Exception ex)
+
+            if (!IPAddress.TryParse(ipRaw, out _))
             {
-                MessageBox.Show("Hata: " + ex.Message, "Client1");
+                txtIp.Focus();
+                throw new Exception($"{label} IP formatı hatalı: '{ipRaw}'");
             }
+
+            if (string.IsNullOrWhiteSpace(portRaw))
+            {
+                txtPort.Focus();
+                throw new Exception($"{label} Port zorunlu. Lütfen port gir.");
+            }
+
+            if (!int.TryParse(portRaw, out int port) || port < 1 || port > 65535)
+            {
+                txtPort.Focus();
+                throw new Exception($"{label} Port geçersiz: '{portRaw}' (1-65535 arası olmalı)");
+            }
+
+            return (ipRaw, port);
+        }
+
+        private void HookLiveValidation()
+        {
+            txtCaIp.TextChanged += (_, __) => UpdateButtonStates();
+            txtCaPort.TextChanged += (_, __) => UpdateButtonStates();
+            txtClient2Ip.TextChanged += (_, __) => UpdateButtonStates();
+            txtClient2Port.TextChanged += (_, __) => UpdateButtonStates();
+        }
+
+        private void UpdateButtonStates()
+        {
+            bool caOk = IsValidIPv4(txtCaIp.Text) && IsValidPort(txtCaPort.Text);
+            bool c2Ok = IsValidIPv4(txtClient2Ip.Text) && IsValidPort(txtClient2Port.Text);
+
+            btnConnectToCA.Enabled = caOk;
+
+            // "Send Ks" için hem CA hem Client2 endpoint gerekli
+            btnSendKsToClient2.Enabled = caOk && c2Ok;
+        }
+
+        private static bool IsValidIPv4(string? ip)
+        {
+            ip = (ip ?? "").Trim();
+            return IPAddress.TryParse(ip, out var addr) && addr.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork;
+        }
+
+        private static bool IsValidPort(string? portText)
+        {
+            portText = (portText ?? "").Trim();
+            return int.TryParse(portText, out int p) && p >= 1 && p <= 65535;
         }
     }
 }
